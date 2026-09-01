@@ -54,6 +54,12 @@ manifests get path dependencies instead, which carry no version requirement at
 all. `ci/prove_rewrite.py` proves this against `ci/pin-drift`, a fixture pinned
 to a release the framework tree can never be again.
 
+Until standout's ROB07 epic branch merges, the scheduled build against `main` is
+red for a reason that is not a finding: `systemdlike` was accepted from a
+schema-4 run report, and `corpus-runner` on `main` still reads schema 2–3. The
+first scheduled run after that merge is the real baseline. Against the epic
+branch the same member is green — the run this repository was verified with.
+
 Two workflows run it:
 
 - **This repository's `Corpus` workflow** builds every member against standout
