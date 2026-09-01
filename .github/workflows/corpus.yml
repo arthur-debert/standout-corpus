@@ -1,0 +1,93 @@
+name: Corpus
+
+# The standing regression net (standout ADR-0036). Every member is frozen, so a
+# red job here is a finding about standout by default: what changed is the
+# framework.
+#
+# No secrets. Produced apps are untrusted code (standout ADR-0023) and this
+# workflow builds and runs them. Should a job here ever need a credential, the
+# mechanism is Doppler through its GitHub Action, in a job that does not check
+# out, build, or run a member — a secret in a job that executes untrusted code
+# is exposed to that code however it is stored.
+
+on:
+  schedule:
+    # Daily, after standout's own overnight traffic has landed on main.
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+    inputs:
+      framework_ref:
+        description: The standout ref to build against
+        default: main
+  push:
+    branches: ['**']
+  pull_request:
+
+concurrency:
+  group: corpus-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  roster:
+    runs-on: ubuntu-latest
+    outputs:
+      members: ${{ steps.roster.outputs.members }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: roster
+        run: echo "members=$(python3 ci/roster.py)" >> "$GITHUB_OUTPUT"
+
+  member:
+    needs: roster
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        member: ${{ fromJSON(needs.roster.outputs.members) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: corpus
+      - uses: actions/checkout@v4
+        with:
+          repository: arthur-debert/standout
+          ref: ${{ inputs.framework_ref || 'main' }}
+          path: standout
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: standout
+      # The disposable copy lives outside the framework checkout: the runner
+      # refuses to evaluate a workspace nested under the source tree the blind
+      # protocol excludes.
+      - name: Build and check ${{ matrix.member }}
+        working-directory: corpus
+        run: >
+          python3 ci/build_member.py ${{ matrix.member }}
+          --framework "$GITHUB_WORKSPACE/standout"
+          --work "$RUNNER_TEMP/corpus"
+
+  rewrite:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: corpus
+      - uses: actions/checkout@v4
+        with:
+          repository: arthur-debert/standout
+          ref: ${{ inputs.framework_ref || 'main' }}
+          path: standout
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: standout
+      - name: A pin the framework outgrew still redirects
+        working-directory: corpus
+        run: >
+          python3 ci/prove_rewrite.py
+          --framework "$GITHUB_WORKSPACE/standout"
+          --work "$RUNNER_TEMP/corpus"

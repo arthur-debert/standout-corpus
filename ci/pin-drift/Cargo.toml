@@ -1,0 +1,15 @@
+[workspace]
+
+[package]
+name = "pin-drift"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# An exact pin on a release the framework tree can never carry again. If the
+# rewrite worked, this builds against the checkout; if it silently fell back to
+# a cargo `[patch]`-shaped redirection, the `=` requirement rejects the checkout
+# and the build fails. That is the proof ADR-0036 asks the corpus CI for, and it
+# costs one file to keep.
+[dependencies]
+standout = "=8.1.1"

@@ -1,0 +1,11 @@
+kind = "archetype"
+archetype = "systemdlike"
+binary = "systemdlike"
+subset = true
+
+# The run this implementation was accepted from: 18/18 acceptance cases, 56/56
+# invariant checks, against standout 9.0.0 with the v9.0.0 documentation
+# snapshot. The report is the one committed at
+# standout:corpus/rerun/runs/systemdlike-1788235792/report.json.
+accepted_from = "systemdlike-1788235792"
+accepted_against = "9.0.0"

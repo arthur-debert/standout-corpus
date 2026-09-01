@@ -1,0 +1,14 @@
+kind = "downstream"
+subset = true
+
+# lookma lives in its own repository and is cloned at this exact commit. The
+# corpus holds a pointer, not a copy: a downstream's port is its own repo's
+# work, and a pointer cannot drift into a fork nobody maintains.
+repo = "https://github.com/arthur-debert/lookma.git"
+commit = "48c8b841ff90be9c1fcccf2051caeb190e4f73bd"
+ref = "standout-9.0"
+
+accepted_against = "9.0.0"
+
+# What "passes its suite" means for a real application: its own tests.
+check = ["cargo", "test", "--workspace"]

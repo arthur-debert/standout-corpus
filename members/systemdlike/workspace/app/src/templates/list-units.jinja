@@ -1,0 +1,5 @@
+{% if show_legend %}[header]{{ "UNIT" | col(widths.unit) }} {{ "LOAD" | col(widths.load) }} {{ "ACTIVE" | col(widths.active) }} SUB[/header]
+{% endif %}{% for u in units %}{{ u.unit | col(widths.unit) }} {{ u.load | col(widths.load) }} [{{ u.active }}]{{ u.active | col(widths.active) }}[/{{ u.active }}] {{ u.sub }}{% if not loop.last %}
+{% endif %}{% endfor %}{% if show_legend %}
+
+[legend]{{ count }} units listed.[/legend]{% endif %}
