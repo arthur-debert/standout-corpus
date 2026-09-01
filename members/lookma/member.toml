@@ -1,6 +1,14 @@
 kind = "downstream"
 subset = true
 
+# Not built yet, and not because of anything about lookma: arthur-debert/lookma
+# is private, this repository's CI carries no secrets (standout ADR-0023 and
+# ADR-0036), and a clone of a private repository needs a credential. The three
+# do not compose. Vendoring lookma's sources here would compose, and is refused:
+# it makes a fork nobody maintains out of a repository whose port is its own
+# work. Delete this key when lookma is public; nothing else has to change.
+blocked = "arthur-debert/lookma is private and this CI carries no credential"
+
 # lookma lives in its own repository and is cloned at this exact commit. The
 # corpus holds a pointer, not a copy: a downstream's port is its own repo's
 # work, and a pointer cannot drift into a fork nobody maintains.

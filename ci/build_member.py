@@ -167,6 +167,9 @@ def main() -> int:
 
     member_dir = REPO / "members" / args.member
     member = tomllib.loads((member_dir / "member.toml").read_text())
+    if member.get("blocked"):
+        print(f"[corpus] {args.member} is not built: {member['blocked']}", file=sys.stderr)
+        return 2
 
     try:
         root = prepare(member_dir, member, work)

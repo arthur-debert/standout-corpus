@@ -14,7 +14,14 @@ A member is an implementation that **passed its acceptance suite**. Two kinds:
 | Member | Kind | Accepted against | What its suite is |
 | --- | --- | --- | --- |
 | `systemdlike` | archetype | standout 9.0.0 | the archetype's `acceptance.toml` in the standout repo, replayed against the binary built here |
-| `lookma` | downstream | standout 9.0.0 | its own `cargo test --workspace` |
+| `lookma` | downstream | standout 9.0.0 | its own `cargo test --workspace` — **declared, not yet built**: see below |
+
+`lookma` is ported, pinned, and passing against a standout checkout on a laptop,
+but no job here can clone it: the repository is private and this CI carries no
+credential. Vendoring its sources would work and is refused — that turns a
+repository whose port is its own work into a fork nobody maintains. The member
+records the blocker and is left out of both workflows until `arthur-debert/lookma`
+is public, at which point deleting one line in its `member.toml` enables it.
 
 An **archetype** member is an application an agent wrote blind, from a written
 spec, against the published documentation, under standout's corpus protocol —
