@@ -8,7 +8,11 @@ name: Corpus
 # workflow builds and runs them. Should a job here ever need a credential, the
 # mechanism is Doppler through its GitHub Action, in a job that does not check
 # out, build, or run a member — a secret in a job that executes untrusted code
-# is exposed to that code however it is stored.
+# is exposed to that code however it is stored. The run's own GITHUB_TOKEN is
+# the same hazard, which is why every checkout below sets
+# `persist-credentials: false`: checkout's default leaves that token in the
+# working copy's git config, where a member's build script or binary could read
+# it back out.
 
 on:
   schedule:
@@ -37,8 +41,12 @@ jobs:
       members: ${{ steps.roster.outputs.members }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - id: roster
-        run: echo "members=$(python3 ci/roster.py)" >> "$GITHUB_OUTPUT"
+        run: |
+          MEMBERS=$(python3 ci/roster.py)
+          echo "members=$MEMBERS" >> "$GITHUB_OUTPUT"
 
   member:
     needs: roster
@@ -51,11 +59,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: corpus
+          persist-credentials: false
       - uses: actions/checkout@v4
         with:
           repository: arthur-debert/standout
           ref: ${{ inputs.framework_ref || 'main' }}
           path: standout
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -65,8 +75,10 @@ jobs:
       # protocol excludes.
       - name: Build and check ${{ matrix.member }}
         working-directory: corpus
+        env:
+          MEMBER: ${{ matrix.member }}
         run: >
-          python3 ci/build_member.py ${{ matrix.member }}
+          python3 ci/build_member.py "$MEMBER"
           --framework "$GITHUB_WORKSPACE/standout"
           --work "$RUNNER_TEMP/corpus"
 
@@ -76,11 +88,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: corpus
+          persist-credentials: false
       - uses: actions/checkout@v4
         with:
           repository: arthur-debert/standout
           ref: ${{ inputs.framework_ref || 'main' }}
           path: standout
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
