@@ -1,0 +1,27 @@
+kind = "archetype"
+archetype = "brewlike"
+binary = "brewlike"
+
+# Scheduled only, for the reason in pnpmlike/member.toml.
+subset = false
+
+# 26 of 28 cases passed; the other two are authored expected-fail PAR02 gap
+# cases (`list-json-payload-carries-the-schema-version`,
+# `machine-help-is-a-versioned-document`) and both landed on `expected-fail`,
+# exactly as written. 84 invariant cells passing, none failing.
+#
+# Judgement: those two count as passing the suite. A suite that says "this
+# fails today, and here is the gap that explains it" is passing when the case
+# fails for that reason — which is the runner's own reading
+# (`CaseOutcome::is_expected` = pass | expected-fail), so "passes its
+# acceptance suite" in ADR-0036 already covers it. Reading it the other way
+# would make every archetype carrying a gap tripwire permanently unfreezable,
+# and gap tripwires are precisely the cases a standing regression net wants to
+# watch.
+#
+# What that means for the build: if PAR02 closes and these two flip to
+# `unexpected-pass`, the build reports the movement and stays green — the gap
+# ledger and suite promotion belong to the parity epic, not here. Re-accept
+# this member from a fresh run when that happens.
+accepted_from = "brewlike-1788245142"
+accepted_against = "9.0.0"

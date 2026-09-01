@@ -43,6 +43,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      # The verdict decides what counts as "the framework broke a produced
+      # application", and it compares against each member's accepted run rather
+      # than against an all-green ideal. That is a loosening, so it is checked
+      # before any member is judged by it.
+      - name: The verdict rules hold
+        working-directory: ci
+        run: python3 test_verdict.py
       - id: roster
         run: |
           MEMBERS=$(python3 ci/roster.py)

@@ -1,0 +1,7 @@
+{#- One space between columns; every column but the last padded to its widest
+    rendered cell, header included. -#}
+{%- set name_width = (["FORMULA"] + (view | map(attribute="name") | list)) | map("length") | max -%}
+[header]{{ "FORMULA" | col(name_width) }} VERSION[/header]
+{%- for formula in view %}
+{{ formula.name | col(name_width) }} {{ formula.installed }}
+{%- endfor %}

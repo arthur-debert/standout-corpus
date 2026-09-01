@@ -111,35 +111,90 @@ def check_archetype(
         framework,
         "acceptance suite",
     )
-    verdict(json.loads(report.read_text()))
+    verdict(json.loads(report.read_text()), json.loads((member_dir / "baseline-report.json").read_text()))
 
 
-def verdict(report: dict) -> None:
-    """Fail on anything the accepted run got right and this one did not."""
+# The runner's own vocabulary (`CaseOutcome::is_expected`): a case behaved as
+# its author wrote it when it passed, or when it failed and the suite said it
+# would.
+#
+# Only `fail` means the produced application stopped working, and only that is
+# red here. `unexpected-pass` — a gap tripwire whose premise no longer holds —
+# is the framework having gained something, and standout's own `gaps.toml`
+# ledger test already fails when that happens; a second alarm here would only
+# teach people that corpus red does not mean an application broke.
+AS_AUTHORED = {"pass", "expected-fail"}
+BROKEN = "fail"
+
+
+def cell_key(check: dict) -> tuple:
+    return (check["command"], check["mode"], check["color"], check["theme"], check["check"])
+
+
+def verdict(report: dict, baseline: dict) -> None:
+    """Compare this run against the run the member was accepted from.
+
+    The comparison is against the baseline rather than against an absolute
+    all-green, because a member is frozen with whatever it actually did when it
+    was accepted: authored expected-fail cases, and — for one member — eight
+    invariant cells a defect in the invariant matrix's own vocabulary makes
+    fail (standout#467). Holding those against every later build would make the
+    member permanently red and say nothing about the framework.
+
+    Movement in either direction is reported. Only a produced application that
+    stopped working is red: a case that now fails, or an invariant cell that now
+    fails. Movement the other way — a gap tripwire whose premise no longer
+    holds, a known-failing cell that started passing — is a framework change
+    someone else owns (standout's `gaps.toml` ledger, standout#467) and a reason
+    to re-accept the member from a fresh run, not a reason to fail this build.
+    """
     acceptance = report["acceptance"]
     if not acceptance["built"]:
         raise Failed(f"the app did not build: {acceptance.get('build_detail')}")
 
-    regressions = [
-        f"case {case['name']}: expected {case['expected']}, got {case['outcome']}"
-        + (f" — {case['detail']}" if case.get("detail") else "")
-        for case in acceptance["cases"]
-        if case["outcome"] != case["expected"]
-    ]
-    regressions += [
-        f"invariant {check['command'] or '<naked>'} [{check['mode']}/{check['color']}]"
-        f" {check['check']}: {check.get('detail') or 'failed'}"
-        for check in report["invariants"]
-        if check["status"] == "fail"
-    ]
+    was = {case["name"]: case["outcome"] for case in baseline["acceptance"]["cases"]}
+    regressions: list[str] = []
+    improvements: list[str] = []
+    for case in acceptance["cases"]:
+        before, now = was.get(case["name"]), case["outcome"]
+        if before is None:
+            regressions.append(f"case {case['name']}: not in the accepted run — the suite changed")
+            continue
+        if before == now:
+            continue
+        moved = f"case {case['name']}: {before} when accepted, {now} now"
+        if now == BROKEN:
+            detail = case.get("detail")
+            regressions.append(moved + (f" — {detail}" if detail else ""))
+        else:
+            improvements.append(moved)
+
+    was_cells = {cell_key(check): check["status"] for check in baseline["invariants"]}
+    for check in report["invariants"]:
+        before, now = was_cells.get(cell_key(check)), check["status"]
+        if before is None or before == now:
+            continue
+        moved = (
+            f"invariant {check['command'] or '<naked>'} [{check['mode']}/{check['color']}]"
+            f" {check['check']}: {before} when accepted, {now} now"
+        )
+        if now == "pass":
+            improvements.append(moved)
+        else:
+            regressions.append(moved + (f" — {check['detail']}" if check.get("detail") else ""))
+
+    for moved in improvements:
+        print(f"[corpus] IMPROVED {moved}", flush=True)
+
     if regressions:
         raise Failed(
-            f"{len(regressions)} check(s) the accepted run passed now fail:\n  "
-            + "\n  ".join(regressions)
+            f"{len(regressions)} check(s) no longer behave the way this member was "
+            "accepted behaving:\n  " + "\n  ".join(regressions)
         )
     print(
         f"[corpus] {len(acceptance['cases'])} acceptance cases and "
-        f"{len(report['invariants'])} invariant checks as accepted",
+        f"{len(report['invariants'])} invariant cells as accepted"
+        + (f", {len(improvements)} improved" if improvements else ""),
         flush=True,
     )
 

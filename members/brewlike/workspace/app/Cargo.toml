@@ -1,0 +1,25 @@
+[workspace]
+
+[package]
+name = "brewlike"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+standout = "=9.0.0"
+standout-dispatch = "=9.0.0"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+anyhow = "1"
+# `minijinja::Value` is what a `context_fn` provider returns; see `cli::app`.
+minijinja = "2"
+# `preserve_order` keeps a record's fields in declaration order — `name`,
+# `installed`, `latest`, `outdated` — everywhere the framework routes handler
+# data through a `serde_json::Value`, `--output json` included.
+serde_json = { version = "1", features = ["preserve_order"] }
+
+[dev-dependencies]
+# `standout_test::serial` re-exports the attribute, but the code it expands to
+# names the `serial_test` crate, so that crate has to be in scope as well.
+serial_test = "3"
+standout-test = "=9.0.0"

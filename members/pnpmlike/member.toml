@@ -1,0 +1,14 @@
+kind = "archetype"
+archetype = "pnpmlike"
+binary = "pnpmlike"
+
+# Scheduled only. The fast subset standout ADR-0036 names is the pilot
+# archetypes plus lookma; pnpmlike is a completion archetype, so it rides the
+# full roster rather than adding a job to every framework PR.
+subset = false
+
+# 32 of 32 acceptance cases on their expected outcome, 28 invariant cells
+# passing and none failing. Nothing to judge: the plainest reading of "passes
+# its acceptance suite" admits this one.
+accepted_from = "pnpmlike-1788246042"
+accepted_against = "9.0.0"

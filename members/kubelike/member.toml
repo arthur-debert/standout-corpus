@@ -1,0 +1,35 @@
+kind = "archetype"
+archetype = "kubelike"
+binary = "kubelike"
+
+# Scheduled only, for the reason in pnpmlike/member.toml.
+subset = false
+
+# 42 of 42 acceptance cases on their expected outcome, its own `-o json` cases
+# included. 58 invariant cells passing, 84 not applicable, and 8 failing: one
+# check (`stdout parses as JSON`) across four commands in two color states.
+#
+# Judgement: admitted. ADR-0036 admits an app that "passes its acceptance
+# suite", and the acceptance suite is what this app passed completely. The
+# eight failing cells are not the suite and not a defect in the app — they are
+# standout#467, a defect in the invariant matrix's own vocabulary: the
+# archetype declares each swept command `rendered` or `opaque-bytes` spec-first,
+# before any application exists, but whether a command renders is the produced
+# application's choice and standout documents two conforming ways to answer the
+# same spec. This agent answered with `Output::Artifact`, whose bytes reach
+# stdout unchanged whatever `--output` says — documented behaviour — so a check
+# that assumes the rendering answer fails. #467 states it directly: "The
+# framework did what it documents; nothing here is a framework defect."
+#
+# Refusing this app would be the corpus judging an implementation for an
+# instrument's mistake, and would keep the archetype standout#467 was filed
+# from out of the net that would notice it changing.
+#
+# What that means for the build: the eight cells are part of what this member
+# was accepted doing, so they are compared against the baseline rather than
+# against green. When #467 is fixed and they start passing, the build reports
+# the movement and stays green; re-accept this member from a fresh run then.
+accepted_from = "kubelike-1788242590"
+accepted_against = "9.0.0"
+known_invariant_failures = 8
+known_invariant_failures_issue = "https://github.com/arthur-debert/standout/issues/467"

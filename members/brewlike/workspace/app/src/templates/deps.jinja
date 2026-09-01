@@ -1,0 +1,13 @@
+{#- One handler, two shapes: a node renders as a tree, a list of names as one
+    name per line. The nesting is walked here, not flattened by the handler. -#}
+{%- macro node(entry, depth) -%}
+{{ " " * (depth * 2) }}{{ entry.name }}
+{%- for child in entry.dependencies %}
+{{ node(child, depth + 1) }}
+{%- endfor -%}
+{%- endmacro -%}
+{%- if view.name is defined -%}
+{{ node(view, 0) }}
+{%- else -%}
+{{ view | join("\n") }}
+{%- endif -%}

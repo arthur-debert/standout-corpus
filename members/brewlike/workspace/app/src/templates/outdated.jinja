@@ -1,0 +1,11 @@
+{#- A legitimately empty answer is a sentence, not a headerless table. -#}
+{%- if view -%}
+{%- set name_width = (["FORMULA"] + (view | map(attribute="name") | list)) | map("length") | max -%}
+{%- set installed_width = (["INSTALLED"] + (view | map(attribute="installed") | list)) | map("length") | max -%}
+[header]{{ "FORMULA" | col(name_width) }} {{ "INSTALLED" | col(installed_width) }} LATEST[/header]
+{%- for formula in view %}
+{{ formula.name | col(name_width) }} {{ formula.installed | col(installed_width) }} {{ formula.latest }}
+{%- endfor %}
+{%- else -%}
+[muted]No outdated formulae.[/muted]
+{%- endif -%}

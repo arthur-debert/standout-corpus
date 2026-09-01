@@ -1,0 +1,3 @@
+[name]{{ view.name }}[/name]: stable {{ view.latest }}
+installed: {{ view.installed }}{% if view.outdated %} [outdated](outdated)[/outdated]{% endif %}
+depends on: {% if view.dependencies %}{{ view.dependencies | join(", ") }}{% else %}none{% endif %}

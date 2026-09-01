@@ -1,0 +1,23 @@
+/* Styling lives here so the templates stay layout only. Every tag below is
+   stripped in `--output text`, and in `auto` when the destination is not a
+   colour-capable terminal, so the plain-text bytes are the spec's bytes. */
+
+.header {
+    font-weight: bold;
+}
+
+.name {
+    font-weight: bold;
+}
+
+.outdated {
+    color: yellow;
+}
+
+.muted {
+    color: gray;
+}
+
+@media (prefers-color-scheme: light) {
+    .outdated { color: red; }
+}
