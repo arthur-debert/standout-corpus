@@ -1,7 +1,11 @@
 kind = "archetype"
 archetype = "systemdlike"
 binary = "systemdlike"
-subset = true
+# Out of the standout PR lane until re-accepted after TERM01
+# (arthur-debert/standout#511): the member declares its own `--no-pager`
+# on `list-units`, which collides with the global flag standout installs
+# from that epic on, so it no longer builds against those PRs.
+subset = false
 
 # The run this implementation was accepted from: 18/18 acceptance cases, 56/56
 # invariant checks, against standout 9.0.0 with the v9.0.0 documentation
