@@ -1,0 +1,103 @@
+#!/bin/bash
+# Run one task: a claude -p session on the task prompt, the framework checked
+# out by the SessionStart hook, the transcript kept, the task's checks run,
+# and the run exported as one OpenTelemetry trace.
+#
+#   bin/run <task> [--ref <git-ref>] [--repo <url-or-path>] [--model <model>]
+#                  [--runs-dir <dir>] [--max-turns <n>] [--judge-model <model>] [--no-judge]
+set -euo pipefail
+
+here=$(cd "$(dirname "$0")/.." && pwd)
+task=""; ref="main"; repo="https://github.com/arthur-debert/standout.git"
+model=""; runs_dir="${CORPUS_RUNS_DIR:-/tmp/standout-corpus}"; max_turns=""
+judge_model=""; judge=1
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --ref) ref="$2"; shift 2 ;;
+    --repo) repo="$2"; shift 2 ;;
+    --model) model="$2"; shift 2 ;;
+    --runs-dir) runs_dir="$2"; shift 2 ;;
+    --max-turns) max_turns="$2"; shift 2 ;;
+    --judge-model) judge_model="$2"; shift 2 ;;
+    --no-judge) judge=0; shift ;;
+    -*) echo "unknown flag $1" >&2; exit 2 ;;
+    *) task="$1"; shift ;;
+  esac
+done
+[ -n "$task" ] || { echo "usage: bin/run <task> [--ref <git-ref>] [--repo <url>] [--model <model>]" >&2; exit 2; }
+task_dir="$here/tasks/$task"
+[ -f "$task_dir/PROMPT.md" ] || { echo "no such task: $task_dir/PROMPT.md" >&2; exit 2; }
+
+run_id="$task-$(date -u +%Y%m%dT%H%M%SZ)"
+run_dir="$runs_dir/$run_id"
+mkdir -p "$run_dir/app"
+cp "$task_dir/PROMPT.md" "$run_dir/PROMPT.md"
+
+cat > "$run_dir/settings.json" <<JSON
+{"hooks": {"SessionStart": [{"matcher": "startup", "hooks": [{"type": "command", "command": "$here/hooks/checkout", "timeout": 600}]}]}}
+JSON
+
+export CORPUS_FRAMEWORK_REPO="$repo" CORPUS_FRAMEWORK_REF="$ref" CORPUS_FRAMEWORK_DIR="$run_dir/standout"
+python3 - "$run_dir" "$task" "$run_id" "$repo" "$ref" "$model" <<'PY'
+import json, sys, time
+run_dir, task, run_id, repo, ref, model = sys.argv[1:]
+json.dump({"task": task, "run_id": run_id, "framework": {"repo": repo, "ref": ref},
+           "model_requested": model or None, "started_at": time.time()},
+          open(f"{run_dir}/run.json", "w"), indent=1)
+PY
+
+echo "[corpus] $run_id: framework $ref, workspace $run_dir/app" >&2
+set +e
+(
+  cd "$run_dir/app" && claude -p "$(cat "$run_dir/PROMPT.md")" \
+    --output-format stream-json --verbose \
+    --permission-mode bypassPermissions \
+    --setting-sources "" --strict-mcp-config \
+    --settings "$run_dir/settings.json" --add-dir "$run_dir" \
+    ${model:+--model "$model"} ${max_turns:+--max-turns "$max_turns"} < /dev/null
+) 2> "$run_dir/stderr.txt" | python3 -c '
+import sys, json, time
+out = open(sys.argv[1], "w")
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        event = json.loads(line)
+    except ValueError:
+        continue
+    event["received_at_ns"] = time.time_ns()
+    out.write(json.dumps(event) + "\n"); out.flush()
+' "$run_dir/transcript.jsonl"
+agent_exit=${PIPESTATUS[0]}
+set -e
+echo "[corpus] agent exited $agent_exit" >&2
+[ -d "$run_dir/standout/.git" ] || echo "[corpus] warning: the SessionStart hook did not check the framework out" >&2
+
+checks_exit=""
+if [ -x "$task_dir/check" ]; then
+  set +e
+  (cd "$run_dir/app" && CORPUS_FRAMEWORK_DIR="$run_dir/standout" "$task_dir/check") > "$run_dir/checks.txt" 2> "$run_dir/checks.stderr.txt"
+  checks_exit=$?
+  set -e
+  echo "[corpus] checks: $(grep -c '^ok ' "$run_dir/checks.txt" || true) ok, $(grep -c '^fail ' "$run_dir/checks.txt" || true) fail" >&2
+fi
+
+python3 - "$run_dir" "$agent_exit" "$checks_exit" <<'PY'
+import json, sys, time
+run_dir, agent_exit, checks_exit = sys.argv[1:]
+meta = json.load(open(f"{run_dir}/run.json"))
+meta["agent_exit"] = int(agent_exit)
+meta["checks_exit"] = int(checks_exit) if checks_exit else None
+meta["finished_at"] = time.time()
+try:
+    meta["framework"]["commit"] = open(f"{run_dir}/framework-commit").read().strip()
+except FileNotFoundError:
+    pass
+json.dump(meta, open(f"{run_dir}/run.json", "w"), indent=1)
+PY
+
+if [ "$judge" = 1 ]; then
+  "$here/bin/judge" "$run_dir" ${judge_model:+--model "$judge_model"} || echo "[corpus] judge failed; exporting without it" >&2
+fi
+"$here/bin/export" "$run_dir"

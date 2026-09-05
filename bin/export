@@ -1,0 +1,352 @@
+#!/usr/bin/env python3
+"""Export one run as an OpenTelemetry trace.
+
+    bin/export <run-dir>
+
+Reads run.json, transcript.jsonl (Claude Code stream-json, one event per
+line, each stamped with received_at_ns) and checks.txt, builds one trace —
+a root span for the run, a generation span per assistant message, a tool
+span per tool call — and posts it as OTLP/JSON over HTTP.
+
+Destination, in order: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, else
+OTEL_EXPORTER_OTLP_ENDPOINT + /v1/traces, else a Langfuse project's OTLP
+endpoint derived from LANGFUSE_BASE_URL / LANGFUSE_PUBLIC_KEY /
+LANGFUSE_SECRET_KEY (or the LANGFUSE_STANDOUT_* spellings). Headers come from
+OTEL_EXPORTER_OTLP_TRACES_HEADERS or OTEL_EXPORTER_OTLP_HEADERS. The trace is
+always also written to <run-dir>/trace.json.
+"""
+
+import base64
+import hashlib
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.request
+
+MAX_TEXT = 20_000
+
+
+def clip(text):
+    text = text if isinstance(text, str) else json.dumps(text)
+    return text if len(text) <= MAX_TEXT else text[:MAX_TEXT] + f"… [{len(text) - MAX_TEXT} more chars]"
+
+
+def attr(key, value):
+    if isinstance(value, bool):
+        return {"key": key, "value": {"boolValue": value}}
+    if isinstance(value, int):
+        return {"key": key, "value": {"intValue": str(value)}}
+    if isinstance(value, float):
+        return {"key": key, "value": {"doubleValue": value}}
+    if isinstance(value, list):
+        return {"key": key, "value": {"arrayValue": {"values": [{"stringValue": str(v)} for v in value]}}}
+    return {"key": key, "value": {"stringValue": clip(value)}}
+
+
+def span_id(*parts):
+    return hashlib.sha256("\x1f".join(parts).encode()).hexdigest()[:16]
+
+
+def content_text(blocks):
+    if isinstance(blocks, str):
+        return blocks
+    out = []
+    for block in blocks or []:
+        if not isinstance(block, dict):
+            out.append(str(block))
+        elif block.get("type") == "text":
+            out.append(block["text"])
+        elif block.get("type") == "tool_use":
+            out.append(f"[tool_use {block['name']}] {json.dumps(block.get('input'))}")
+        elif block.get("type") == "tool_result":
+            out.append(content_text(block.get("content")))
+    return "\n".join(out)
+
+
+def framework_reads(tool_name, tool_input, framework_dir):
+    """Which framework files a tool call read, as ('docs' | 'source') per path.
+
+    Read/Grep/Glob name one path; a Bash command can name several (cat, sed,
+    grep, ls, cd ... && cat), so every framework path in its text counts.
+    """
+    if not isinstance(tool_input, dict) or not framework_dir:
+        return []
+    if tool_name == "Bash":
+        paths = re.findall(re.escape(framework_dir) + r"[^\s\"'`;|&()<>]*", tool_input.get("command", ""))
+        command = tool_input.get("command", "")
+        if framework_dir in command and not paths:
+            paths = [framework_dir]
+        rels = [p[len(framework_dir):] for p in paths] + re.findall(r"(?:^|\s)((?:docs|crates)/[^\s\"'`;|&()<>]+)", command) * (framework_dir in command)
+    elif tool_name in ("Read", "Grep", "Glob"):
+        path = str(tool_input.get("file_path") or tool_input.get("path") or "")
+        if not path.startswith(framework_dir):
+            return []
+        rels = [path[len(framework_dir):]]
+    else:
+        return []
+    kinds = []
+    for rel in rels:
+        rel = "/" + rel.lstrip("/")
+        if rel in ("/", ""):
+            continue
+        if "/docs/" in rel or rel.endswith(".md"):
+            kinds.append("docs")
+        elif "/src/" in rel or rel.endswith(".rs"):
+            kinds.append("source")
+    return kinds
+
+
+def build(run_dir):
+    meta = json.load(open(os.path.join(run_dir, "run.json")))
+    events = [json.loads(l) for l in open(os.path.join(run_dir, "transcript.jsonl")) if l.strip()]
+    framework_dir = os.path.join(run_dir, "standout")
+    task, run_id = meta["task"], meta["run_id"]
+    trace_id = hashlib.sha256(run_id.encode()).hexdigest()[:32]
+    root_id = span_id(run_id, "root")
+
+    checks = []
+    checks_path = os.path.join(run_dir, "checks.txt")
+    if os.path.exists(checks_path):
+        for line in open(checks_path):
+            parts = line.rstrip("\n").split(" ", 2)
+            if parts and parts[0] in ("ok", "fail") and len(parts) > 1:
+                checks.append({"name": parts[1], "ok": parts[0] == "ok", "detail": parts[2] if len(parts) > 2 else ""})
+
+    spans = []
+    session_id, model, result = None, meta.get("model_requested"), None
+    first_ns = events[0]["received_at_ns"] if events else 0
+    last_ns = events[-1]["received_at_ns"] if events else 0
+    prev_ns = first_ns
+    prompt_path = os.path.join(run_dir, "PROMPT.md")
+    if not os.path.exists(prompt_path):
+        prompt_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tasks", task, "PROMPT.md")
+    prompt = open(prompt_path).read() if os.path.exists(prompt_path) else ""
+    pending_input = [prompt]
+    tool_calls = {}
+    usage_total = {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0}
+    reads = {"docs": 0, "source": 0}
+    messages = {}
+    order = []
+
+    for event in events:
+        kind = event.get("type")
+        if kind == "system" and event.get("subtype") == "init":
+            session_id = event.get("session_id")
+            model = event.get("model") or model
+        elif kind == "assistant":
+            message = event["message"]
+            key = message.get("id") or str(len(order))
+            if key not in messages:
+                messages[key] = {"blocks": [], "start": prev_ns, "input": "\n".join(pending_input), "usage": {}}
+                order.append(key)
+                pending_input = []
+            messages[key]["blocks"].extend(message.get("content") or [])
+            messages[key]["end"] = event["received_at_ns"]
+            messages[key]["usage"] = message.get("usage") or messages[key]["usage"]
+            messages[key]["model"] = message.get("model") or model
+            for block in message.get("content") or []:
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    tool_calls[block["id"]] = {"name": block["name"], "input": block.get("input"),
+                                              "start": event["received_at_ns"], "parent": key}
+                    for which in framework_reads(block["name"], block.get("input"), framework_dir):
+                        reads[which] += 1
+        elif kind == "user":
+            for block in event["message"].get("content") or []:
+                if isinstance(block, dict) and block.get("type") == "tool_result" and block.get("tool_use_id") in tool_calls:
+                    call = tool_calls[block["tool_use_id"]]
+                    call["end"] = event["received_at_ns"]
+                    call["output"] = content_text(block.get("content"))
+                    call["is_error"] = bool(block.get("is_error"))
+                    pending_input.append(f"[tool_result {call['name']}] {call['output']}")
+                else:
+                    pending_input.append(content_text(event["message"].get("content")))
+        elif kind == "result":
+            result = event
+        prev_ns = event["received_at_ns"]
+
+    for key in order:
+        message = messages[key]
+        usage = message["usage"]
+        usage_total["input"] += usage.get("input_tokens", 0)
+        usage_total["output"] += usage.get("output_tokens", 0)
+        usage_total["cache_read"] += usage.get("cache_read_input_tokens", 0)
+        usage_total["cache_creation"] += usage.get("cache_creation_input_tokens", 0)
+        spans.append({
+            "traceId": trace_id, "spanId": span_id(run_id, "msg", key), "parentSpanId": root_id,
+            "name": message.get("model") or "assistant", "kind": 1,
+            "startTimeUnixNano": str(message["start"]), "endTimeUnixNano": str(message.get("end", message["start"])),
+            "attributes": [
+                attr("langfuse.observation.type", "generation"),
+                attr("gen_ai.request.model", message.get("model") or ""),
+                attr("gen_ai.usage.input_tokens", usage.get("input_tokens", 0)),
+                attr("gen_ai.usage.output_tokens", usage.get("output_tokens", 0)),
+                attr("gen_ai.usage.cache_read_input_tokens", usage.get("cache_read_input_tokens", 0)),
+                attr("langfuse.observation.input", message["input"]),
+                attr("langfuse.observation.output", content_text(message["blocks"])),
+            ],
+            "status": {},
+        })
+    for call_id, call in tool_calls.items():
+        spans.append({
+            "traceId": trace_id, "spanId": span_id(run_id, "tool", call_id),
+            "parentSpanId": span_id(run_id, "msg", call["parent"]),
+            "name": call["name"], "kind": 1,
+            "startTimeUnixNano": str(call["start"]), "endTimeUnixNano": str(call.get("end", call["start"])),
+            "attributes": [
+                attr("langfuse.observation.type", "tool"),
+                attr("tool.name", call["name"]),
+                attr("langfuse.observation.input", call.get("input")),
+                attr("langfuse.observation.output", call.get("output", "")),
+            ],
+            "status": {"code": 2} if call.get("is_error") else {},
+        })
+
+    root_attrs = [
+        attr("langfuse.observation.type", "span"),
+        attr("langfuse.trace.name", task),
+        attr("langfuse.session.id", run_id),
+        attr("langfuse.trace.tags", [task, meta["framework"].get("ref", "")]),
+        attr("langfuse.observation.input", prompt),
+        attr("langfuse.observation.output", (result or {}).get("result", "")),
+        attr("corpus.task", task),
+        attr("corpus.run_id", run_id),
+        attr("corpus.framework.repo", meta["framework"].get("repo", "")),
+        attr("corpus.framework.ref", meta["framework"].get("ref", "")),
+        attr("corpus.framework.commit", meta["framework"].get("commit", "")),
+        attr("corpus.agent.session_id", session_id or ""),
+        attr("corpus.agent.exit_code", meta.get("agent_exit", -1)),
+        attr("corpus.agent.turns", (result or {}).get("num_turns", len(order))),
+        attr("corpus.agent.cost_usd", float((result or {}).get("total_cost_usd", 0.0))),
+        attr("corpus.agent.duration_ms", (result or {}).get("duration_ms", (last_ns - first_ns) // 1_000_000)),
+        attr("corpus.agent.result", (result or {}).get("subtype", "missing")),
+        attr("corpus.framework.doc_reads", reads["docs"]),
+        attr("corpus.framework.source_reads", reads["source"]),
+        attr("gen_ai.request.model", model or ""),
+        attr("gen_ai.usage.input_tokens", usage_total["input"]),
+        attr("gen_ai.usage.output_tokens", usage_total["output"]),
+        attr("gen_ai.usage.cache_read_input_tokens", usage_total["cache_read"]),
+        attr("corpus.checks.total", len(checks)),
+        attr("corpus.checks.passed", sum(1 for c in checks if c["ok"])),
+        attr("corpus.checks", json.dumps(checks)),
+    ]
+    judge_path = os.path.join(run_dir, "judge.json")
+    judge = json.load(open(judge_path)) if os.path.exists(judge_path) else None
+    if judge:
+        counts = {}
+        for finding in judge.get("findings", []):
+            counts[finding["category"]] = counts.get(finding["category"], 0) + 1
+        for name, value in (judge.get("scores") or {}).items():
+            root_attrs.append(attr(f"corpus.judge.{name}", float(value)))
+        for category, count in counts.items():
+            root_attrs.append(attr(f"corpus.judge.findings.{category}", count))
+        spans.append({
+            "traceId": trace_id, "spanId": span_id(run_id, "judge"), "parentSpanId": root_id,
+            "name": "judge", "kind": 1,
+            "startTimeUnixNano": str(last_ns), "endTimeUnixNano": str(last_ns + int((judge.get("judge") or {}).get("duration_ms") or 0) * 1_000_000),
+            "attributes": [
+                attr("langfuse.observation.type", "evaluator"),
+                attr("gen_ai.request.model", (judge.get("judge") or {}).get("model") or ""),
+                attr("langfuse.observation.input", "transcript, NOTES.md, checks"),
+                attr("langfuse.observation.output", json.dumps({"summary": judge.get("summary"), "findings": judge.get("findings")}, indent=1)),
+            ],
+            "status": {},
+        })
+    spans.insert(0, {
+        "traceId": trace_id, "spanId": root_id, "name": task, "kind": 1,
+        "startTimeUnixNano": str(first_ns), "endTimeUnixNano": str(last_ns),
+        "attributes": root_attrs,
+        "status": {"code": 2} if checks and not all(c["ok"] for c in checks) else {},
+    })
+    payload = {"resourceSpans": [{
+        "resource": {"attributes": [attr("service.name", "standout-corpus"), attr("service.version", meta["framework"].get("ref", ""))]},
+        "scopeSpans": [{"scope": {"name": "standout-corpus/export"}, "spans": spans}],
+    }]}
+    return trace_id, payload, judge
+
+
+def post_scores(endpoint, headers, trace_id, judge):
+    """Langfuse keeps scores beside the trace; any other OTLP destination has them as root attributes."""
+    marker = "/api/public/otel"
+    if marker not in endpoint or not judge:
+        return 0
+    base = endpoint[: endpoint.index(marker)]
+    posted = 0
+    for name, value in (judge.get("scores") or {}).items():
+        body = json.dumps({"traceId": trace_id, "name": name, "value": float(value), "dataType": "NUMERIC",
+                           "comment": judge.get("summary", "")[:1000]}).encode()
+        request = urllib.request.Request(base + "/api/public/scores", data=body, method="POST",
+                                         headers={"Content-Type": "application/json", **headers})
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                response.read()
+            posted += 1
+        except urllib.error.HTTPError as error:
+            print(f"[corpus] score {name} refused: HTTP {error.code} {error.read()[:200]!r}", file=sys.stderr)
+    return posted
+
+
+def destination():
+    env = os.environ.get
+    headers = {}
+    raw = env("OTEL_EXPORTER_OTLP_TRACES_HEADERS") or env("OTEL_EXPORTER_OTLP_HEADERS") or ""
+    for pair in filter(None, raw.split(",")):
+        key, _, value = pair.partition("=")
+        headers[key.strip()] = value.strip()
+    if env("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"):
+        return env("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"), headers
+    if env("OTEL_EXPORTER_OTLP_ENDPOINT"):
+        return env("OTEL_EXPORTER_OTLP_ENDPOINT").rstrip("/") + "/v1/traces", headers
+    base = env("LANGFUSE_BASE_URL") or env("LANGFUSE_STANDOUT_BASE_URL")
+    public = env("LANGFUSE_PUBLIC_KEY") or env("LANGFUSE_STANDOUT_PUBLIC_KEY")
+    secret = env("LANGFUSE_SECRET_KEY") or env("LANGFUSE_STANDOUT_SECRET_KEY")
+    if base and public and secret:
+        token = base64.b64encode(f"{public}:{secret}".encode()).decode()
+        return base.rstrip("/") + "/api/public/otel/v1/traces", {"Authorization": f"Basic {token}", "x-langfuse-ingestion-version": "4"}
+    return None, headers
+
+
+def main():
+    run_dir = sys.argv[1]
+    trace_id, payload, judge = build(run_dir)
+    json.dump(payload, open(os.path.join(run_dir, "trace.json"), "w"), indent=1)
+    endpoint, headers = destination()
+    if not endpoint:
+        print(f"[corpus] trace {trace_id} written to {run_dir}/trace.json; no OTLP endpoint configured, not sent", file=sys.stderr)
+        return
+    body = json.dumps(payload).encode()
+    request = urllib.request.Request(endpoint, data=body, method="POST",
+                                     headers={"Content-Type": "application/json", **headers})
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            response.read()
+    except urllib.error.HTTPError as error:
+        print(f"[corpus] export failed: HTTP {error.code} from {endpoint}: {error.read()[:300]!r}", file=sys.stderr)
+        sys.exit(1)
+    print(f"[corpus] trace {trace_id} ({len(payload['resourceSpans'][0]['scopeSpans'][0]['spans'])} spans) sent to {endpoint}", file=sys.stderr)
+    posted = post_scores(endpoint, headers, trace_id, judge)
+    if posted:
+        print(f"[corpus] {posted} judge scores attached", file=sys.stderr)
+    link = trace_link(endpoint, headers, trace_id)
+    if link:
+        print(f"[corpus] {link}", file=sys.stderr)
+
+
+def trace_link(endpoint, headers, trace_id):
+    """A Langfuse destination can name the trace's page; any other cannot."""
+    marker = "/api/public/otel"
+    if marker not in endpoint:
+        return None
+    base = endpoint[: endpoint.index(marker)]
+    request = urllib.request.Request(base + "/api/public/projects", headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            projects = json.load(response).get("data") or []
+    except (urllib.error.URLError, ValueError):
+        return None
+    return f"{base}/project/{projects[0]['id']}/traces/{trace_id}" if projects else None
+
+
+if __name__ == "__main__":
+    main()
