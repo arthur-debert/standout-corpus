@@ -94,13 +94,11 @@ material for them.
 ## Layout
 
 - `bin/run`, `bin/export`, `hooks/checkout`, `tasks/` — the runner above.
-- `members/`, `ci/`, `.github/workflows/corpus.yml` — the earlier frozen-member
-  regression build: accepted implementations rebuilt against a standout
-  checkout on a schedule. Unchanged by the runner above; the standout PR
-  lane that used to build its fast subset is gone from the standout
-  repository.
-- `legacy/` — the blind-run corpus program as it stood in standout at
-  12.0.0, moved here verbatim and unbuilt: the archetype roster and its
-  suites (`legacy/corpus`), the sandboxed runner (`legacy/corpus-runner`,
-  which depended on standout workspace crates by path), the committed run
-  reports and scorecards, and the page on running a set.
+- `legacy/` — the blind-run corpus program as it stood at standout 12.0.0,
+  kept verbatim and unbuilt: the archetype roster and its suites
+  (`legacy/corpus`), the sandboxed runner (`legacy/corpus-runner`, which
+  depended on standout workspace crates by path), the committed run reports
+  and scorecards, the page on running a set, and this repository's own
+  frozen-member build (`legacy/members`, `legacy/ci`), whose scheduled and
+  per-PR workflows are gone. Nothing runs automatically; runs are started by
+  hand with `bin/run` until the new loop is tuned.
