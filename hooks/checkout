@@ -1,0 +1,30 @@
+#!/bin/bash
+# SessionStart hook: check the framework under test out beside the workspace
+# and tell the session where it is.
+set -euo pipefail
+
+input=$(cat)
+cwd=$(printf '%s' "$input" | python3 -c 'import sys, json; print(json.load(sys.stdin)["cwd"])')
+
+repo="${CORPUS_FRAMEWORK_REPO:-https://github.com/arthur-debert/standout.git}"
+ref="${CORPUS_FRAMEWORK_REF:-main}"
+dest="${CORPUS_FRAMEWORK_DIR:-$(dirname "$cwd")/standout}"
+
+if [ ! -d "$dest/.git" ]; then
+  if ! git clone --quiet --depth 1 --branch "$ref" "$repo" "$dest" 2>/dev/null; then
+    rm -rf "$dest"
+    git clone --quiet "$repo" "$dest" >&2
+    git -C "$dest" checkout --quiet "$ref" >&2
+  fi
+fi
+commit=$(git -C "$dest" rev-parse HEAD)
+printf '%s\n' "$commit" > "$dest/../framework-commit"
+
+context="The Rust CLI framework under test, standout, is checked out at $dest \
+(ref $ref, commit $commit). Its documentation is $dest/docs — start at \
+docs/index.md, then docs/guides/ and docs/topics/ — plus $dest/crates/*/docs/. \
+Depend on it with path dependencies, e.g. \
+standout = { path = \"$dest/crates/standout\" }."
+
+python3 -c 'import sys, json
+print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": sys.argv[1]}}))' "$context"

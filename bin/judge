@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+"""Judge one run: read the transcript, the agent's notes and the checks, and
+classify each need the task raised by how standout, its documentation and
+the agent's path to it fit together.
+
+    bin/judge <run-dir> [--model <model>]
+
+Writes <run-dir>/judge.json: findings, scores in [0, 1], and a summary.
+The judge is a claude -p session with no tools and a JSON schema; the
+rubric below is the whole prompt, so iterating on the judge is editing this
+file.
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+RUBRIC = """You judge one recorded session in which a coding agent built a small
+Rust CLI with the standout framework, working from the framework's
+documentation, with the framework's source also available in the checkout.
+Your job is to say, for each need the task raised, how the need, standout's
+features, its documentation and the agent's path to them fit together.
+
+Classify every finding with exactly one category:
+- worked: the need was met by a framework feature the agent found through
+  the documentation without detours.
+- hard-to-discover: the feature exists and was used, but the agent got there
+  through detours: reading framework source, trial and error, a doc page
+  that pointed elsewhere.
+- docs-wrong: the documentation said one thing and the framework did another
+  (quote both).
+- workaround: the need was met by application code that bypasses or
+  re-implements something the framework should own.
+- gap: the framework has no facility for the need; the application had to
+  own it outright.
+- agent-error: the agent misread or ignored documentation that answered the
+  need; not the framework's fault.
+
+For each finding give the need in the adopter's words, the standout feature
+involved (or "none"), the category, evidence quoted from the transcript or
+notes, and the layer a fix belongs to: docs, prompt, cli-help, api, or none.
+
+Then score the run from 0 to 1: docs_accuracy (did the docs describe what the
+framework does), discoverability (could the agent find what it needed where
+it looked first), api_fit (did the framework's API express the need without
+workarounds), and your confidence in this judgement. Be concrete and
+sceptical: a run where every check passed can still be full of workarounds,
+and source reads are a signal, not a verdict."""
+
+SCHEMA = {
+    "type": "object",
+    "properties": {
+        "summary": {"type": "string"},
+        "findings": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "need": {"type": "string"},
+                    "feature": {"type": "string"},
+                    "category": {"type": "string", "enum": ["worked", "hard-to-discover", "docs-wrong", "workaround", "gap", "agent-error"]},
+                    "evidence": {"type": "string"},
+                    "fix_layer": {"type": "string", "enum": ["docs", "prompt", "cli-help", "api", "none"]},
+                },
+                "required": ["need", "feature", "category", "evidence", "fix_layer"],
+            },
+        },
+        "scores": {
+            "type": "object",
+            "properties": {
+                "docs_accuracy": {"type": "number"},
+                "discoverability": {"type": "number"},
+                "api_fit": {"type": "number"},
+                "confidence": {"type": "number"},
+            },
+            "required": ["docs_accuracy", "discoverability", "api_fit", "confidence"],
+        },
+    },
+    "required": ["summary", "findings", "scores"],
+}
+
+MAX_CHARS = 150_000
+
+
+def condense(run_dir):
+    """The transcript as a readable log: what the agent said, called and got back."""
+    lines = []
+    for raw in open(os.path.join(run_dir, "transcript.jsonl")):
+        event = json.loads(raw)
+        if event.get("type") == "assistant":
+            for block in event["message"].get("content") or []:
+                if block.get("type") == "text" and block["text"].strip():
+                    lines.append(f"ASSISTANT: {block['text'].strip()}")
+                elif block.get("type") == "tool_use":
+                    lines.append(f"TOOL {block['name']} {json.dumps(block.get('input'))[:600]}")
+        elif event.get("type") == "user":
+            for block in event["message"].get("content") or []:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    content = block.get("content")
+                    if isinstance(content, list):
+                        content = "\n".join(b.get("text", "") for b in content if isinstance(b, dict))
+                    text = str(content or "").strip()
+                    lines.append(f"RESULT{' (error)' if block.get('is_error') else ''}: {text[:1500]}")
+    text = "\n".join(lines)
+    if len(text) > MAX_CHARS:
+        half = MAX_CHARS // 2
+        text = text[:half] + f"\n\n[... {len(text) - MAX_CHARS} chars elided ...]\n\n" + text[-half:]
+    return text
+
+
+def read_if_present(path):
+    return open(path).read() if os.path.exists(path) else ""
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("run_dir")
+    parser.add_argument("--model", default="claude-opus-5")
+    args = parser.parse_args()
+    run_dir = args.run_dir
+    meta = json.load(open(os.path.join(run_dir, "run.json")))
+    prompt = read_if_present(os.path.join(run_dir, "PROMPT.md")) or read_if_present(
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tasks", meta["task"], "PROMPT.md"))
+    material = "\n\n".join([
+        f"# Task prompt\n\n{prompt}",
+        f"# Framework\n\n{json.dumps(meta.get('framework'))}",
+        f"# Checks (ok/fail per check)\n\n{read_if_present(os.path.join(run_dir, 'checks.txt')) or '(no checks)'}",
+        f"# The agent's NOTES.md\n\n{read_if_present(os.path.join(run_dir, 'app', 'NOTES.md')) or '(none written)'}",
+        f"# Session log\n\n{condense(run_dir)}",
+    ])
+    command = ["claude", "-p", "--output-format", "json", "--json-schema", json.dumps(SCHEMA),
+               "--system-prompt", RUBRIC, "--tools", "", "--max-turns", "1",
+               "--setting-sources", "", "--strict-mcp-config", "--model", args.model]
+    completed = subprocess.run(command, capture_output=True, text=True, cwd=run_dir, input=material)
+    if completed.returncode != 0:
+        print(f"[corpus] judge session failed ({completed.returncode}): {completed.stderr[-500:]}", file=sys.stderr)
+        sys.exit(1)
+    envelope = json.loads(completed.stdout)
+    verdict = envelope.get("structured_output")
+    if verdict is None:
+        text = envelope.get("result", "")
+        start, end = text.find("{"), text.rfind("}")
+        verdict = json.loads(text[start:end + 1]) if start >= 0 else None
+    if not isinstance(verdict, dict) or "findings" not in verdict:
+        print(f"[corpus] judge returned no verdict: {completed.stdout[:500]}", file=sys.stderr)
+        sys.exit(1)
+    verdict["judge"] = {"model": args.model, "session_id": envelope.get("session_id"),
+                        "cost_usd": envelope.get("total_cost_usd"), "duration_ms": envelope.get("duration_ms")}
+    json.dump(verdict, open(os.path.join(run_dir, "judge.json"), "w"), indent=1)
+    counts = {}
+    for finding in verdict["findings"]:
+        counts[finding["category"]] = counts.get(finding["category"], 0) + 1
+    print(f"[corpus] judge: {len(verdict['findings'])} findings {json.dumps(counts)}; scores {json.dumps(verdict['scores'])}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,142 +1,104 @@
 # standout-corpus
 
-Accepted [standout](https://github.com/arthur-debert/standout) implementations,
-frozen, with a build. **A red build here is a standout finding by default**: the
-members do not change, so what changed is the framework.
+Agent runs that build small things with [standout](https://github.com/arthur-debert/standout),
+recorded as OpenTelemetry traces. A run is one Claude Code session on one
+task prompt against one framework ref; what it read, what it built, what it
+had to work around, and whether the task's checks pass all land in the
+trace. The traces are the material for judging where standout, its
+documentation and its discoverability work together and where they do not.
 
-This repository is the standing regression net standout's ADR-0036 describes. It
-is deliberately not a product.
+## Running a task
 
-## What is in here, and what "accepted" means
+```bash
+doppler run -- bin/run smoke --ref v12.0.0
+```
 
-A member is an implementation that **passed its acceptance suite**. Two kinds:
+`bin/run <task>` does, in order:
 
-| Member | Kind | Accepted against | In the PR subset | What it did when accepted |
-| --- | --- | --- | --- | --- |
-| `systemdlike` | archetype | standout 9.0.0 | yes | 18/18 cases, 56 invariant cells passing, none failing |
-| `kubelike` | archetype | standout 9.0.0 | no | 42/42 cases; 8 invariant cells failing, all standout#467 |
-| `pnpmlike` | archetype | standout 9.0.0 | no | 32/32 cases, 28 invariant cells passing, none failing |
-| `brewlike` | archetype | standout 9.0.0 | no | 26 passing + 2 authored expected-fail (PAR02), 84 invariant cells passing |
-| `lookma` | downstream | standout 9.0.0 | — | its own `cargo test --workspace` — **declared, not yet built**: see below |
+1. Makes `/tmp/standout-corpus/<task>-<timestamp>/` with an empty `app/`
+   directory as the session's working directory.
+2. Starts `claude -p` on `tasks/<task>/PROMPT.md`, with a settings file whose
+   only content is a `SessionStart` hook, `hooks/checkout`. The hook clones
+   the framework at `--ref` (default `main`, from `--repo`, default the
+   GitHub repository) to `<run>/standout` and tells the session where the
+   checkout and its documentation are. The agent depends on the framework
+   by path, so any commit is testable, released or not.
+3. Keeps the session's stream-json transcript as `<run>/transcript.jsonl`,
+   each event stamped with the time it arrived.
+4. Runs `tasks/<task>/check` in `app/`, if the task has one. It prints one
+   `ok <name>` or `fail <name> <detail>` line per check; the lines land in
+   `<run>/checks.txt`.
+5. Judges the run with `bin/judge <run>`: a tool-less `claude -p` session
+   reads the transcript, the agent's `NOTES.md` and the checks, and returns
+   findings under a fixed rubric (worked, hard-to-discover, docs-wrong,
+   workaround, gap, agent-error; each with evidence and the layer a fix
+   belongs to) plus four scores in [0, 1]. The rubric is the top of
+   `bin/judge`; iterating on the judge is editing it. `<run>/judge.json`
+   holds the verdict.
+6. Exports the run as one trace with `bin/export <run>`.
 
-An archetype's suite is the `acceptance.toml` in the standout repo, replayed
-against the binary built here. A downstream's suite is its own test command.
+Flags: `--ref`, `--repo` (a URL or a local path), `--model`, `--max-turns`,
+`--runs-dir`, `--judge-model` (default `claude-opus-5`), `--no-judge`.
+Every step can be re-run on its own against an existing run directory.
 
-**The PR subset** is the members cheap enough for the standout PR lane, which
-ADR-0036 scopes to the pilot archetypes plus lookma. The completion archetypes
-above run on the schedule instead, so a framework PR pays for one member rather
-than four.
+The `SessionStart` hook works interactively too: in any directory,
+`CORPUS_FRAMEWORK_REF=v12.0.0 claude --settings <run>/settings.json` gives a
+human the same checkout and context an agent gets.
 
-`lookma` is ported, pinned, and passing against a standout checkout on a laptop,
-but no job here can clone it: the repository is private and this CI carries no
-credential. Vendoring its sources would work and is refused — that turns a
-repository whose port is its own work into a fork nobody maintains. The member
-records the blocker and is left out of both workflows until `arthur-debert/lookma`
-is public, at which point deleting one line in its `member.toml` enables it.
+## Where the trace goes
 
-An **archetype** member is an application an agent wrote blind, from a written
-spec, against the published documentation, under standout's corpus protocol —
-committed here with the report it was accepted from. A **downstream** member is a
-real application in its own repository, pointed at by commit; the corpus holds
-the pointer, not a copy, because a downstream's port is its own repo's work.
+`bin/export` speaks OTLP/JSON over HTTP and needs nothing but Python. It
+sends to, in order of preference: `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`;
+`OTEL_EXPORTER_OTLP_ENDPOINT` plus `/v1/traces`; or a Langfuse project's
+OTLP endpoint derived from `LANGFUSE_BASE_URL`, `LANGFUSE_PUBLIC_KEY` and
+`LANGFUSE_SECRET_KEY` (the `LANGFUSE_STANDOUT_*` spellings also work).
+Headers come from `OTEL_EXPORTER_OTLP_TRACES_HEADERS` or
+`OTEL_EXPORTER_OTLP_HEADERS`. Nothing in this repository names a
+destination or a key: the Langfuse project we use lives in Doppler
+(`github` project, `prd` config, the `LANGFUSE_STANDOUT_*` secrets), which
+is what `doppler.yaml` points `doppler run` at. The trace is always also
+written to `<run>/trace.json`.
 
-### What "passes its acceptance suite" admits, and what it does not
+Claude Code's own OpenTelemetry export is not used: this build emits logs
+and metrics but no traces, and Langfuse ingests traces only.
 
-ADR-0036 admits an app that passes its acceptance suite. Three readings came up
-while promoting the runs above, and each member's `member.toml` carries the one
-that applies to it:
+The trace shape, in [Langfuse's OTLP vocabulary](https://langfuse.com/integrations/native/opentelemetry)
+and the `gen_ai.*` semantic conventions, so any OTLP backend reads it:
 
-- **An authored expected-fail case that failed as authored counts as passing.**
-  A suite saying "this fails today, and here is the gap" is passing when the case
-  fails for that reason — the runner's own `CaseOutcome::is_expected` says so.
-  The other reading would make every archetype carrying a gap tripwire
-  permanently unfreezable, and tripwires are exactly what a regression net wants
-  to watch. (`brewlike`, two PAR02 cases.)
-- **An invariant-matrix failure is not an acceptance-suite failure.** The
-  invariant matrix is a separate instrument, and when the instrument is the thing
-  at fault the app should not be refused for it. `kubelike` passes 42 of 42
-  acceptance cases and fails 8 invariant cells to standout#467, a defect in the
-  matrix's own vocabulary: the archetype declares each command `rendered` or
-  `opaque-bytes` before any application exists, but which one a command is is the
-  application's choice, and standout documents two conforming ways to answer.
-  #467 says it outright — "the framework did what it documents; nothing here is a
-  framework defect."
-- **An unexpected-pass is not passing.** It means a gap tripwire's premise no
-  longer holds — a real signal, owned by the parity epic and by standout's
-  `gaps.toml` ledger, and an open question rather than a stable baseline. An app
-  whose run is full of them is not frozen here. (`cargolike` with 21 and
-  `gcloudlike` with 24 were declined on this.)
+- One root span per run, named after the task, with the prompt as input and
+  the agent's final message as output. Its attributes are the run's hard
+  facts: `corpus.task`, `corpus.run_id`, `corpus.framework.{repo,ref,commit}`,
+  `corpus.agent.{session_id,exit_code,turns,cost_usd,duration_ms,result}`,
+  `corpus.framework.doc_reads` and `corpus.framework.source_reads` (how many
+  times the agent read the framework's documentation versus its source),
+  `gen_ai.usage.*` totals, and `corpus.checks.{total,passed}` plus the
+  `corpus.checks` list. `langfuse.session.id` is the run id and the tags are
+  the task and the ref.
+- One generation span per assistant message: model, token usage, the tool
+  results it saw as input, its text and tool calls as output.
+- One tool span per tool call, under the generation that made it, with the
+  call's input and result; an errored tool result marks the span.
+- One evaluator span for the judge, carrying its findings as output; the
+  scores are root attributes (`corpus.judge.*`) and, when the destination is
+  Langfuse, scores on the trace.
 
-A real acceptance failure is still a refusal, with no reading available:
-`dockerlike` failed two cases it was supposed to pass, and `ghlike`, `gitlike`,
-`formlike` and `validity` each failed or unexpectedly passed cases in the 9.0
-re-run.
+## Tasks
 
-## Frozen means frozen
+A task is a directory under `tasks/` with `PROMPT.md` and, optionally, an
+executable `check`. `smoke` is the loop's own proof: a two-flag `greet`
+command whose checks build it and run it three ways. Tasks that measure
+something about standout come from the touchpoints real adopters need; the
+archetype specs under `legacy/corpus/archetypes/*/spec.md` are one source of
+material for them.
 
-No feature work, no refactoring, no cleanups, no dependency bumps, no
-maintenance beyond porting passes some later standout epic explicitly budgets.
-A member's manifest keeps the exact `=x.y.z` pins it was accepted against, and
-those are never rewritten in place: they are the historical record of what the
-implementation was accepted against.
+## Layout
 
-## The build
-
-`ci/build_member.py` copies a member, redirects its standout dependencies onto a
-checked-out framework tree, builds it, and runs its suite.
-
-**What makes a build red.** The result is compared against the run the member was
-accepted from, not against an all-green ideal — a member is frozen with whatever
-it actually did, authored expected-fail cases and standout#467's eight cells
-included, and holding those against every later build would make the member
-permanently red while saying nothing about the framework. So: a case or an
-invariant cell that **now fails** is red, because a produced application stopped
-working. Movement the other way — a known-failing cell that started passing, a
-gap tripwire whose premise no longer holds — is printed as `IMPROVED`, leaves the
-build green, and means the member should be re-accepted from a fresh run.
-standout's own `gaps.toml` ledger test is the alarm for a closed gap; a second
-alarm here would only teach people that corpus red does not mean an application
-broke. `ci/test_verdict.py` pins all of that and runs before any member is
-judged by it.
-
-The redirection cannot be a cargo `[patch]`. Patching changes where a package
-comes from, but the member's `=` requirement must still be satisfied, and the
-framework tree outgrows that pin the moment `main` bumps a version. So the copy's
-manifests get path dependencies instead, which carry no version requirement at
-all. `ci/prove_rewrite.py` proves this against `ci/pin-drift`, a fixture pinned
-to a release the framework tree can never be again.
-
-Until standout's ROB07 epic branch merges, the scheduled build against `main` is
-red for a reason that is not a finding: every member was accepted from a schema-4
-run report, and `corpus-runner` on `main` still reads schema 2–3 — and the four
-completion archetypes do not exist on `main` at all. The first scheduled run
-after that merge is the real baseline. Against the epic branch every member is
-green, which is what this repository was verified with.
-
-Two workflows run it:
-
-- **This repository's `Corpus` workflow** builds every member against standout
-  `main`, daily and on demand.
-- **standout's own `Corpus` workflow** checks out this repository on framework
-  PRs and builds the fast subset — the members marked `subset = true`.
-
-## No secrets
-
-Members are untrusted code (standout ADR-0023), and this repository's CI builds
-and runs them. It carries no secrets, and no workflow here may be given one.
-Should some job ever need a credential, the mechanism is Doppler through its
-GitHub Action, in a job that does not check out, build, or run a member: a
-secret in a job that executes untrusted code is exposed to that code however it
-is stored.
-
-## Adding a member
-
-1. Confirm it passed its suite, using the readings above. Where one of them is
-   what admits the member — an authored expected-fail, an invariant failure that
-   belongs to the instrument — say so in `member.toml`, with the issue number.
-   An unexplained failure is a refusal.
-2. Add `members/<name>/member.toml`. For an archetype, commit the produced
-   `workspace/app` sources (no build output) and the sanitized report it was
-   accepted from; for a downstream, record the repo and the exact commit.
-3. Mark `subset = true` only if it is cheap enough to build on every standout PR.
-4. Run `ci/build_member.py <name>` against a standout checkout before pushing.
+- `bin/run`, `bin/export`, `hooks/checkout`, `tasks/` — the runner above.
+- `legacy/` — the blind-run corpus program as it stood at standout 12.0.0,
+  kept verbatim and unbuilt: the archetype roster and its suites
+  (`legacy/corpus`), the sandboxed runner (`legacy/corpus-runner`, which
+  depended on standout workspace crates by path), the committed run reports
+  and scorecards, the page on running a set, and this repository's own
+  frozen-member build (`legacy/members`, `legacy/ci`), whose scheduled and
+  per-PR workflows are gone. Nothing runs automatically; runs are started by
+  hand with `bin/run` until the new loop is tuned.
